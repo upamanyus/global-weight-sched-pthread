@@ -197,8 +197,8 @@ Definition slot_state
 Admitted.
 
 Definition queue_inv_inner
-    (γq γph γpp : gname) (q : loc) (cap : nat) : iProp Σ :=
-  ∃ (head tail : nat) (slots : loc) (vs : list val)
+    (γq γph γpp : gname) (q slots : loc) (cap : nat) : iProp Σ :=
+  ∃ (head tail : nat) (vs : list val)
     (turns svals : list val)
     (push_inflight pop_inflight : gmap Z val),
     ⌜(head ≤ tail ≤ head + cap)%nat⌝ ∗
@@ -209,7 +209,6 @@ Definition queue_inv_inner
     ⌜∀ p, p ∈ dom pop_inflight → (0 ≤ p < Z.of_nat head)%Z⌝ ∗
     (q +ₗ 0) ↦ #(Z.of_nat head) ∗
     (q +ₗ 1) ↦ #(Z.of_nat tail) ∗
-    (q +ₗ 2) ↦ #slots ∗
     own γq (●E vs) ∗
     own γph (● ((Excl <$> push_inflight) : gmap Z (excl val))) ∗
     own γpp (● ((Excl <$> pop_inflight) : gmap Z (excl val))) ∗
@@ -225,10 +224,14 @@ Definition queue_inv_inner
 
 Definition queueN := nroot .@ "mpmcv1".
 
+(** [is_queue γq q cap] is the persistent client-facing handle.  It records
+    a pinned [slots] pointer ([↦□]) and the namespace invariant relating the
+    physical state to [γq]. *)
 Definition is_queue (γq : gname) (q : loc) (cap : nat) : iProp Σ :=
-  ∃ γph γpp,
+  ∃ γph γpp (slots : loc),
     ⌜(0 < cap)%nat⌝ ∗
-    inv queueN (queue_inv_inner γq γph γpp q cap).
+    (q +ₗ 2) ↦□ #slots ∗
+    inv queueN (queue_inv_inner γq γph γpp q slots cap).
 
 Definition queue_content (γq : gname) (vs : list val) : iProp Σ :=
   own γq (◯E vs).
@@ -287,6 +290,8 @@ Proof.
   change (q +ₗ 1%nat) with (q +ₗ 1).
   change (q +ₗ 2%nat) with (q +ₗ 2).
   wp_store.
+  (* Make the slots pointer persistent (it never changes after this point). *)
+  iMod (pointsto_persist with "Hs") as "#Hs".
   (* Allocate ghost state. *)
   iMod (own_alloc (●E ([] : list val) ⋅ ◯E ([] : list val)))
     as (γq) "[Hγa Hγf]".
@@ -311,10 +316,10 @@ Proof.
        The flat array of [cap*2] cells split into the per-slot pairs. *)
     admit. }
   iMod (inv_alloc queueN _
-          (queue_inv_inner γq γph γpp q capn)
+          (queue_inv_inner γq γph γpp q slots capn)
           with "[-HΦ Hγf]") as "#Hinv".
   { iNext.
-    iExists 0%nat, 0%nat, slots, [], (replicate capn #0), (replicate capn #0),
+    iExists 0%nat, 0%nat, [], (replicate capn #0), (replicate capn #0),
             ∅, ∅.
     rewrite !fmap_empty.
     iSplit; [iPureIntro; lia|].
@@ -323,14 +328,14 @@ Proof.
     iSplit; [done|].
     iSplit; [iPureIntro; set_solver|].
     iSplit; [iPureIntro; set_solver|].
-    iFrame "Hh Ht Hs Hγa Hγph Hγpp Ht0 Hs0".
+    iFrame "Hh Ht Hγa Hγph Hγpp Ht0 Hs0".
     iPureIntro.
     (* The slot-state invariant for the all-zero case.
        This is left as an admit; see the discussion at end of file. *)
     admit. }
   iModIntro. iApply ("HΦ" $! q γq).
   iSplitR "Hγf"; last by iFrame.
-  iExists γph, γpp. by iFrame "Hinv".
+  iExists γph, γpp, slots. by iFrame "Hs Hinv".
 Admitted.
 
 (* -------------------------------------------------------------------------- *)
@@ -352,24 +357,149 @@ Lemma queue_push_spec γq q cap (v : val) :
         queue_content γq (if b then vs ++ [v] else vs)
       | RET #b }>>.
 Proof.
-  (* The proof has the structure of a Löb induction over the witnessed
-     [pos], with three sub-cases inside the loop body:
-       (1) turn = exp_turn ∧ CAS succeeds  — successful push, LP at the CAS:
-            - open the invariant; observe [pos < head + cap] from the slot
-              state; apply [excl_auth_update] on [γq] to replace [vs] with
-              [vs ++ [v]] using the AU's commit branch; allocate a fresh
-              [push_inflight] token [{[ pos := Excl v ]}]; close the
-              invariant at the new tail [pos+1] with the updated [piph];
-            - then step (2) of the impl writes the slot value, opening the
-              invariant and using the in-flight token to identify the slot;
-            - step (3) writes the turn, opens the invariant, removes the
-              [pos] entry from [piph] and re-establishes "published" state.
-       (2) turn = exp_turn ∧ CAS fails — recurse with witnessed pos.
-       (3) turn ≠ exp_turn — re-read [tail]; if equal to [pos] commit AU as
-                             [b = false] (vs unchanged); else recurse.
-     Each of the three cases needs a careful arithmetic argument that the
-     observed [turn] is consistent with the slot's lifecycle, decoded via
-     [slot_state].  We leave the proof as a structured admit. *)
+  iIntros "#Hq" (Φ) "AU".
+  iDestruct "Hq" as (γph γpp slots) "(%Hcap & #Hs & #Hinv)".
+  rewrite /queue_push. wp_pures.
+  (* === Step 1: read the slots pointer (it is persistent: ↦□) === *)
+  wp_load.
+  wp_pures.
+  (* === Step 2: read the initial tail value === *)
+  wp_bind (! _)%E.
+  iInv "Hinv" as (head1 tail1 vs1 turns1 svals1 piph1 pipp1)
+    "(>%Hht1 & >%Htlen1 & >%Hslen1 & >%Hvslen1 & >%Hphdom1 & >%Hppdom1 &
+       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots1)".
+  wp_load.
+  iModIntro.
+  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  { iNext.
+    iExists head1, tail1, vs1, turns1, svals1, piph1, pipp1. by iFrame. }
+  wp_pures.
+  (* Clear the snapshot hypotheses we don't carry into the loop. *)
+  clear Hht1 Hvslen1 Hphdom1 Hppdom1 Hslots1 Hslen1 Htlen1.
+  clear vs1 turns1 svals1 piph1 pipp1 head1.
+  (* === Step 3: Löb induction over the witnessed [pos] === *)
+  iLöb as "IH" forall (tail1).
+  wp_pures.
+  (* The ring index [idx = tail1 mod cap] is a [nat] less than [cap]. *)
+  set (idx := (tail1 mod cap)%nat).
+  assert (Hidx : (idx < cap)%nat) by (subst idx; apply Nat.mod_upper_bound; lia).
+  (* Show that the program's [pos `rem` cap] equals [Z.of_nat idx]. *)
+  rewrite (_ : (Z.of_nat tail1 `rem` Z.of_nat cap)%Z = Z.of_nat idx);
+    [|subst idx;
+      rewrite Z.rem_mod_nonneg; [rewrite Nat2Z.inj_mod //|lia|lia]].
+  wp_pures.
+  (* === Read the slot's turn at index [idx] === *)
+  wp_bind (! _)%E.
+  iInv "Hinv" as (head' tail' vs' turns' svals' piph' pipp')
+    "(>%Hht' & >%Htlen' & >%Hslen' & >%Hvslen' & >%Hphdom' & >%Hppdom' &
+       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots')".
+  (* Extract the [idx]-th turn pointsto from [Htblock]. *)
+  assert (Hlt : (idx < length turns')%nat) by (rewrite Htlen'; lia).
+  destruct (lookup_lt_is_Some_2 _ _ Hlt) as [tv Htv].
+  iDestruct (big_sepL_lookup_acc _ _ _ _ Htv with "Htblock")
+    as "[Hslot Hclose]".
+  iDestruct "Hslot" as "[>%Hzv >Hslot]".
+  destruct Hzv as [z ->].
+  (* The slot pointer in the program is [slots +ₗ (idx * 2)]; in the
+     invariant it is [slots +ₗ (2 * idx)].  Rewrite both sides to match. *)
+  replace (Z.of_nat idx * 2)%Z with (2 * Z.of_nat idx)%Z by lia.
+  wp_load.
+  (* Reassemble the block. *)
+  iDestruct ("Hclose" with "[Hslot]") as "Htblock".
+  { iSplit; [iPureIntro; by exists z|]. iFrame. }
+  iModIntro.
+  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  { iNext.
+    iExists head', tail', vs', turns', svals', piph', pipp'. by iFrame. }
+  wp_pures.
+  (* === Compare the witnessed turn [z] with the expected turn === *)
+  set (exp_turn := (Z.of_nat tail1 `quot` Z.of_nat cap * 2)%Z).
+  case_bool_decide as Heq.
+  - (* (A) turn = exp_turn — try to claim the slot via CAS on tail. *)
+    wp_pures.
+    (* Bind the CAS. *)
+    wp_bind (CmpXchg _ _ _).
+    iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
+      "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
+         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+    (* CAS succeeds iff [#(Z.of_nat tail'') = #(Z.of_nat tail1)]. *)
+    destruct (decide (tail'' = tail1)) as [-> | Hne].
+    + (* CAS succeeds — LP for push-success. *)
+      wp_cmpxchg_suc.
+      (* Open the AU and commit with [b = true], [vs ++ [v]]. *)
+      iMod "AU" as (vs_au) "[Hf [_ Hcommit]]".
+      iDestruct (queue_content_agree with "Hγa Hf") as %->.
+      iMod (queue_content_update _ _ _ (vs_au ++ [v]) with "Hγa Hf")
+        as "[Hγa Hf]".
+      iMod ("Hcommit" $! true with "Hf") as "HΦ".
+      (* Allocate a push-inflight token at [tail1] mapping to [v].  This
+         lets steps (2) and (3) of the implementation locate the slot
+         and commit the publication.  Updating the auth ghost is a frame
+         lemma over [auth (gmap _ (excl _))]; we leave the token-creation
+         step admitted. *)
+      iAssert (|==> own γph (● ((Excl <$> <[Z.of_nat tail1 := v]>piph'')
+                                  : gmap Z (excl val))) ∗
+                    own γph (◯ ({[Z.of_nat tail1 := Excl v]}
+                                  : gmap Z (excl val))))%I
+        with "[Hγph]" as ">[Hγph Htok]".
+      { admit. }
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', (S tail1), (vs_au ++ [v]), turns'', svals'',
+                (<[Z.of_nat tail1 := v]>piph''), pipp''.
+        rewrite (_ : Z.of_nat (S tail1) = (Z.of_nat tail1 + 1)%Z); last lia.
+        iFrame.
+        (* Re-establish the pure facts of the invariant.  These are the
+           reasons we tracked head/tail/vs and the in-flight maps so
+           explicitly; the proofs are pure arithmetic and manipulation
+           of [slot_state].  Left admitted. *)
+        admit. }
+      wp_pures.
+      (* Steps (2): write the slot value.  Open the invariant, locate the
+         slot via the in-flight token, perform the store, restore the
+         invariant.  Step (3): write the turn, removing the token. *)
+      admit.
+    + (* CAS fails — recurse with the witnessed [tail''] as new pos. *)
+      wp_cmpxchg_fail.
+      { intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
+        by iFrame. }
+      wp_pures.
+      iApply ("IH" with "AU").
+  - (* (B) turn ≠ exp_turn — re-read tail and decide. *)
+    wp_pures.
+    wp_bind (! _)%E.
+    iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
+      "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
+         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+    wp_load.
+    destruct (decide (tail'' = tail1)) as [-> | Hne].
+    + (* Tail unchanged — LP for push-failure: commit AU as [b = false]. *)
+      iMod "AU" as (vs_au) "[Hf [_ Hcommit]]".
+      iMod ("Hcommit" $! false with "Hf") as "HΦ".
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', tail1, vs'', turns'', svals'', piph'', pipp''.
+        by iFrame. }
+      wp_pures.
+      rewrite bool_decide_true; last done.
+      wp_pures. done.
+    + (* Tail changed — recurse on the new witness. *)
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
+        by iFrame. }
+      wp_pures.
+      rewrite bool_decide_false.
+      2:{ intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
+      wp_pures.
+      iApply ("IH" with "AU").
 Admitted.
 
 (* -------------------------------------------------------------------------- *)
