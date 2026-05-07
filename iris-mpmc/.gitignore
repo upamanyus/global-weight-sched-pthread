@@ -6,3 +6,4 @@ CoqMakefile.conf
 *.vok
 *.vos
 *.glob
+.lia.cache
