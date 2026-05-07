@@ -10,26 +10,46 @@ State of the proof (right now)
 
 mpmcv1.v COMPILES with these admits (grep -n "admit\|Admitted"):
 
-  1. slot_state body itself (Definition ... : Prop. Admitted.)
-       — the per-position lifecycle predicate; deliberately abstract.
+  1. new_queue_spec:
+       - line 336: re-indexing the flat AllocN block into per-slot turn/value
+         pairs (pure list manipulation; needs a big_sepL "interleave" helper)
+       - line 364: trailing Admitted (closes once the above is done)
 
-  2. new_queue_spec:
-       - re-indexing the flat AllocN block into per-slot turn/value pairs
-       - the all-zero slot_state instance
-
-  3. queue_push_spec — Löb induction set up; failure branches PROVED:
-       - turn = exp ∧ CAS fails → recurse: PROVED
-       - turn ≠ exp ∧ tail unchanged → AU commit b=false: PROVED
-       - turn ≠ exp ∧ tail changed → recurse: PROVED
+  2. queue_push_spec — Löb induction set up; failure branches PROVED;
+     CAS-success branch ghost-token allocation PROVED.
      Admitted:
-       - CAS-success branch ghost token allocation
-       - re-establishing invariant after CAS-success
-       - publication steps (slot value write + turn write)
+       - line 497: re-establish invariant after CAS-success
+                   (slot_state preservation + dom-inflight bookkeeping)
+       - line 502: publication steps (slot value write + turn write,
+                   each opens the inv, finds slot via in-flight token,
+                   does the store, removes the token on the turn write)
+       - line 543: trailing Admitted
 
-  4. queue_pop_spec — written in the same shape as push BUT not yet
-     compiled (the user interrupted compilation right after the edit).
-     RUN `make` FIRST and fix any errors.  Same admits structure as push
-     plus an extra `assert (∃ v vs', vs_au = v :: vs')` that needs proof.
+  3. queue_pop_spec — symmetric to push.  Failure branches PROVED.
+     Admitted:
+       - line 630: ∃ v vs', vs_au = v :: vs'.  Requires bridging two
+         invariant openings (load and CAS).  See "Bridging" below.
+       - line 646: re-establish invariant after CAS-success
+       - line 650: publication steps
+       - line 692: trailing Admitted
+
+What's been DONE
+----------------
+
+  • slot_state defined concretely as a 3-case disjunction:
+      (A) current entry  — ∃ p ∈ [head, tail), p mod cap = i, with
+          A1: p ∈ piph, turn = 2*(p/cap)
+          A2: p ∉ piph, turn = 2*(p/cap)+1, vs!!(p-head) = Some sval
+      (B) recent pop     — no current p, ∃ p < head with p mod cap = i,
+          B1: p ∈ pipp, turn = 2*(p/cap)+1
+          B2: p ∉ pipp, turn = 2*(p/cap)+2
+      (C) never touched  — no p, turn = 0.
+
+  • new_queue_spec all-zero slot_state case (line 336 of old file): proved
+    via case (C) with vacuous quantifiers.
+
+  • Push-success token allocation (line 445 of old file): proved via
+    auth_update_alloc + alloc_singleton_local_update.
 
 Architecture
 ------------
@@ -51,36 +71,72 @@ Architecture
         spurious failures (no fullness/emptiness witness, which would
         need prophecy variables).
 
-What to do next
----------------
+Bridging the two invariant openings (the line-630 admit)
+--------------------------------------------------------
 
-  Step 0: `make` and fix queue_pop's compile errors.
+The argument:
+  At load time (state '), we observe turn = exp_turn = 2*(head1/cap)+1
+  at slot idx = head1 mod cap.  Slot_state forces case A2 (cases B1,
+  B2, C are ruled out by parity / round arithmetic), giving p = head1
+  and head' ≤ head1 < tail'.
 
-  Step 1: Define slot_state concretely.  Suggested form: a per-slot
-    case analysis matching on whether the most recent op at idx is
-    a published push, an in-flight push (∈ piph), a finished pop, or
-    an in-flight pop (∈ pipp).  See the long comment at lines ~170-191
-    in mpmcv1.v.
+  At CAS time (state ''), head'' = head1.  We need head1 < tail''.
 
-  Step 2: Prove the two new_queue_spec admits.  Both are pure list
-    arithmetic (re-indexing big_sepL by pairs; trivial slot_state
-    for empty queue with all turns = 0).
+  We have *neither* head nor tail monotonicity captured in the
+  invariant.  Two options:
+    (a) Add `own γtl (●MN tail) ∗ own γhd (●MN head)` to the invariant.
+        Take a snapshot ◯MN (S head1) of γtl during the load opening
+        (after deriving tail' ≥ S head1 via case A2).  Use it at the
+        CAS opening to conclude tail'' ≥ S head1 > head1.
+    (b) Use prophecy variables for the linearisation point of pop.
 
-  Step 3: Discharge the queue_push success branch:
-      a. Token allocation lemma: for an [auth (gmap Z (excl val))],
-         frame-extending the auth and producing a fresh fragment.
-         Look for "auth_update_alloc" or use "own_update" with
-         "alloc_singleton_local_update".
-      b. After CAS-tail-success, prove length (vs_au ++ [v]) ≤ cap
-         from slot_state at idx (turn = exp_turn ⇒ slot is post-pop or
-         never-pushed ⇒ pos < head + cap).
-      c. Steps 2/3 (slot store + turn write): each opens the inv,
-         finds the slot via big_sepL_lookup_acc, performs the op,
-         updates piph (remove the entry on the turn write).
+  Option (a) is the standard Iris idiom; option (b) is heavier.
 
-  Step 4: Symmetric work for queue_pop.  The Hvshd assertion (vs_au
-    is non-empty) follows from: turn = (head/cap)*2+1 ⇒ slot is
-    published ⇒ head1 < tail'' ⇒ length vs_au = tail'' - head1 ≥ 1.
+Bigger admits remaining
+-----------------------
+
+  Line 497 / 646 (re-establish invariant after CAS-success):
+
+    Push case:
+      old: head'', tail1, vs_au, turns'', svals'', piph'', pipp''
+      new: head'', S tail1, vs_au ++ [v], turns'', svals'',
+           <[Z.of_nat tail1 := v]>piph'', pipp''
+    Need to re-prove:
+      - head'' ≤ S tail1 ≤ head'' + cap   (need tail1 < head'' + cap,
+        which follows from slot_state at idx = tail1 mod cap with
+        turn = 2*(tail1/cap), forcing case A1 with p = tail1 — implies
+        head'' ≤ tail1 — and the invariant tail1 ≤ head'' + cap.)
+      - length (vs_au ++ [v]) = S tail1 - head''
+        (= length vs_au + 1 = (tail1 - head'') + 1 = S tail1 - head'')
+      - dom (<[…]>piph'') ⊆ [head'', S tail1)
+      - slot_state (cap, head'', S tail1, vs_au ++ [v],
+                    <[…]>piph'', pipp'')  for every slot
+        ⤷ The slot at idx changes case from "B/C/A2" to "A1" with
+          the new in-flight push.  Other slots are stable: the
+          `dom piph''` bumps don't affect them since the constraint
+          is at p, not at i.
+
+    Pop case (line 646): symmetric, with pipp'' updated and vs going
+    from v::vs_rest to vs_rest.
+
+    The slot_state preservation is the heart of these proofs.  It
+    will be tedious but mechanical: case-split on which case the slot
+    is in, in both old and new state, and discharge the arithmetic.
+
+  Line 502 / 650 (publication steps):
+
+    Push: write slot value (consume nothing, store), then write turn
+    (consume γph token, advance turn, mark slot published).
+      • Each step opens the invariant.
+      • Locate the slot via the index from the in-flight token.
+      • Update the heap value or turn.
+      • For the turn write, also remove the entry from piph (via
+        delete_singleton_local_update on the auth).
+      • Re-establish slot_state for that slot: A1 → A2 (the slot
+        transitions from "in-flight push" to "published").
+
+    Pop: read slot value (use γpp token to identify p), then write
+    new turn (advances 2k+1 → 2k+2, transitioning B1 → B2).
 
 Helpful lemmas / tactics
 ------------------------
@@ -93,6 +149,8 @@ Helpful lemmas / tactics
   • Loc.add_0 — for q +ₗ 0 ↔ q.
   • wp_cmpxchg_suc / wp_cmpxchg_fail (with a goal "values differ").
   • Nat2Z.inj : Z.of_nat n = Z.of_nat m → n = m.
+  • For Z.quot/Z.rem ↔ Nat.div/Nat.modulo:
+      Z.rem_mod_nonneg, Nat2Z.inj_mod, Nat2Z.inj_div.
 
 Invariants to keep visible
 --------------------------

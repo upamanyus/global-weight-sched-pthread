@@ -282,6 +282,43 @@ Proof.
 Qed.
 
 (* -------------------------------------------------------------------------- *)
+(*           Helper: split a flat block of pointsto's into pairs              *)
+(* -------------------------------------------------------------------------- *)
+
+(** A flat block of [2*n] zero-initialised cells from [AllocN] can be re-indexed
+    as two parallel arrays of length [n] (turn cells at offsets [2*i],
+    value cells at offsets [2*i+1]).  Used by [new_queue_spec]. *)
+Lemma alloc_block_split_zero (l : loc) (n : nat) :
+  ([∗ list] i ∈ seq 0 (2*n), (l +ₗ (i : nat)) ↦ #0) ⊢
+  ([∗ list] i ↦ tv ∈ replicate n #0,
+     ⌜∃ z : Z, tv = #z⌝ ∗ (l +ₗ (2 * Z.of_nat i)) ↦ tv) ∗
+  ([∗ list] i ↦ sv ∈ replicate n #0,
+     (l +ₗ (2 * Z.of_nat i + 1)) ↦ sv).
+Proof.
+  iIntros "H".
+  iInduction n as [|n IH] forall (l).
+  { simpl. by iSplitL. }
+  replace (2 * S n)%nat with (2 * n + 2)%nat by lia.
+  rewrite seq_app big_sepL_app.
+  iDestruct "H" as "[Hrest Hpair]".
+  iDestruct ("IH" with "Hrest") as "[HtR HsR]".
+  rewrite (replicate_S_end n #0) !big_sepL_app !length_replicate.
+  simpl.
+  iDestruct "Hpair" as "(Hp0 & Hp1 & _)".
+  iSplitL "HtR Hp0".
+  - iSplitL "HtR"; first iFrame.
+    rewrite right_id.
+    iSplit.
+    { iPureIntro. by exists 0%Z. }
+    rewrite (_ : (2 * Z.of_nat (n + 0))%Z = Z.of_nat (0 + 2 * n)); last lia.
+    iExact "Hp0".
+  - iSplitL "HsR"; first iFrame.
+    rewrite right_id.
+    rewrite (_ : (2 * Z.of_nat (n + 0) + 1)%Z = Z.of_nat (1 + 2 * n)); last lia.
+    iExact "Hp1".
+Qed.
+
+(* -------------------------------------------------------------------------- *)
 (*                       Specification: [new_queue]                           *)
 (* -------------------------------------------------------------------------- *)
 
