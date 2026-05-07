@@ -193,8 +193,27 @@ Context `{!heapGS Σ, !queueG Σ}.
 Definition slot_state
     (cap : nat) (head tail : nat) (vs : list val)
     (push_inflight pop_inflight : gmap Z val)
-    (i : nat) (turn : Z) (sval : val) : Prop.
-Admitted.
+    (i : nat) (turn : Z) (sval : val) : Prop :=
+  (* (A) Current entry: there is a position p ∈ [head, tail) with p mod cap = i. *)
+  (∃ p : nat, (head ≤ p < tail)%nat ∧ (p mod cap = i)%nat ∧
+              ((Z.of_nat p ∈ dom push_inflight ∧
+                turn = (2 * Z.of_nat (p / cap))%Z) ∨
+               (Z.of_nat p ∉ dom push_inflight ∧
+                turn = (2 * Z.of_nat (p / cap) + 1)%Z ∧
+                vs !! (p - head)%nat = Some sval)))
+  ∨
+  (* (B) No current entry; recent pop position p < head at ring index i. *)
+  ((∀ p : nat, (head ≤ p < tail)%nat → (p mod cap)%nat ≠ i) ∧
+   (∃ p : nat, (p < head)%nat ∧ (p mod cap = i)%nat ∧
+               ((Z.of_nat p ∈ dom pop_inflight ∧
+                 turn = (2 * Z.of_nat (p / cap) + 1)%Z) ∨
+                (Z.of_nat p ∉ dom pop_inflight ∧
+                 turn = (2 * Z.of_nat (p / cap) + 2)%Z))))
+  ∨
+  (* (C) Never touched at this ring index. *)
+  ((∀ p : nat, (head ≤ p < tail)%nat → (p mod cap)%nat ≠ i) ∧
+   (∀ p : nat, (p < head)%nat → (p mod cap)%nat ≠ i) ∧
+   turn = 0%Z).
 
 Definition queue_inv_inner
     (γq γph γpp : gname) (q slots : loc) (cap : nat) : iProp Σ :=
@@ -330,9 +349,15 @@ Proof.
     iSplit; [iPureIntro; set_solver|].
     iFrame "Hh Ht Hγa Hγph Hγpp Ht0 Hs0".
     iPureIntro.
-    (* The slot-state invariant for the all-zero case.
-       This is left as an admit; see the discussion at end of file. *)
-    admit. }
+    (* The slot-state invariant for the all-zero case: every slot is in
+       case (C) ("never touched"), with vacuous quantifiers since head =
+       tail = 0. *)
+    intros i Hi. exists 0%Z. split.
+    { rewrite lookup_replicate_2 //. }
+    right. right. split_and!.
+    - intros p [Hge Hlt]. lia.
+    - intros p Hlt. lia.
+    - reflexivity. }
   iModIntro. iApply ("HΦ" $! q γq).
   iSplitR "Hγf"; last by iFrame.
   iExists γph, γpp, slots. by iFrame "Hs Hinv".
@@ -442,7 +467,22 @@ Proof.
                     own γph (◯ ({[Z.of_nat tail1 := Excl v]}
                                   : gmap Z (excl val))))%I
         with "[Hγph]" as ">[Hγph Htok]".
-      { admit. }
+      { iMod (own_update _ _
+                (● ((Excl <$> <[Z.of_nat tail1 := v]>piph'')
+                      : gmap Z (excl val)) ⋅
+                 ◯ ({[Z.of_nat tail1 := Excl v]}
+                      : gmap Z (excl val)))
+              with "Hγph") as "[Hauth Hfrag]".
+        { apply auth_update_alloc.
+          rewrite fmap_insert.
+          apply alloc_singleton_local_update; [|done].
+          rewrite lookup_fmap.
+          destruct (piph'' !! Z.of_nat tail1) as [v'|] eqn:Heqp; last done.
+          exfalso.
+          assert (Hin : Z.of_nat tail1 ∈ dom piph'')
+            by (apply elem_of_dom; eauto).
+          specialize (Hphdom'' _ Hin). lia. }
+        iModIntro. iFrame. }
       iModIntro.
       iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
       { iNext.
