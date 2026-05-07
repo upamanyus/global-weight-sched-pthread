@@ -519,15 +519,136 @@ Lemma queue_pop_spec γq q cap :
         end
       | RET (match ov with Some v => SOMEV v | None => NONEV end) }>>.
 Proof.
-  (* Symmetric to [queue_push_spec]:
-       (1) turn = exp_turn ∧ CAS succeeds — successful pop, LP at the CAS:
-            destruct [vs = v :: vs']; commit AU with [Some v]; allocate a
-            [pop_inflight] entry [{[ pos := Excl v ]}].  The pop's
-            subsequent slot-load reads [v] from the in-flight token; the
-            turn-write removes [pos] from [pipp].
-       (2) turn = exp_turn ∧ CAS fails — recurse.
-       (3) turn ≠ exp_turn — re-read [head]; if equal to [pos] commit AU
-                             as [None] with [vs] unchanged; else recurse. *)
+  iIntros "#Hq" (Φ) "AU".
+  iDestruct "Hq" as (γph γpp slots) "(%Hcap & #Hs & #Hinv)".
+  rewrite /queue_pop. wp_pures.
+  (* === Read slots (persistent) === *)
+  wp_load.
+  wp_pures.
+  (* === Initial read of head === *)
+  wp_bind (! _)%E.
+  iInv "Hinv" as (head1 tail1 vs1 turns1 svals1 piph1 pipp1)
+    "(>%Hht1 & >%Htlen1 & >%Hslen1 & >%Hvslen1 & >%Hphdom1 & >%Hppdom1 &
+       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots1)".
+  wp_load.
+  iModIntro.
+  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  { iNext.
+    iExists head1, tail1, vs1, turns1, svals1, piph1, pipp1.
+    by iFrame. }
+  wp_pures.
+  clear Hht1 Hvslen1 Hphdom1 Hppdom1 Hslots1 Hslen1 Htlen1.
+  clear vs1 turns1 svals1 piph1 pipp1 tail1.
+  (* === Löb induction on the witnessed [head1 : nat] === *)
+  iLöb as "IH" forall (head1).
+  wp_pures.
+  set (idx := (head1 mod cap)%nat).
+  assert (Hidx : (idx < cap)%nat) by (subst idx; apply Nat.mod_upper_bound; lia).
+  rewrite (_ : (Z.of_nat head1 `rem` Z.of_nat cap)%Z = Z.of_nat idx);
+    [|subst idx;
+      rewrite Z.rem_mod_nonneg; [rewrite Nat2Z.inj_mod //|lia|lia]].
+  wp_pures.
+  (* === Read the slot's turn at index [idx] === *)
+  wp_bind (! _)%E.
+  iInv "Hinv" as (head' tail' vs' turns' svals' piph' pipp')
+    "(>%Hht' & >%Htlen' & >%Hslen' & >%Hvslen' & >%Hphdom' & >%Hppdom' &
+       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots')".
+  assert (Hlt : (idx < length turns')%nat) by (rewrite Htlen'; lia).
+  destruct (lookup_lt_is_Some_2 _ _ Hlt) as [tv Htv].
+  iDestruct (big_sepL_lookup_acc _ _ _ _ Htv with "Htblock")
+    as "[Hslot Hclose]".
+  iDestruct "Hslot" as "[>%Hzv >Hslot]".
+  destruct Hzv as [z ->].
+  replace (Z.of_nat idx * 2)%Z with (2 * Z.of_nat idx)%Z by lia.
+  wp_load.
+  iDestruct ("Hclose" with "[Hslot]") as "Htblock".
+  { iSplit; [iPureIntro; by exists z|]. iFrame. }
+  iModIntro.
+  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  { iNext.
+    iExists head', tail', vs', turns', svals', piph', pipp'. by iFrame. }
+  wp_pures.
+  set (exp_turn := (Z.of_nat head1 `quot` Z.of_nat cap * 2 + 1)%Z).
+  case_bool_decide as Heq.
+  - (* (A) turn = exp_turn — try to claim the slot via CAS on head. *)
+    wp_pures.
+    wp_bind (CmpXchg _ _ _).
+    iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
+      "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
+         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+    rewrite Loc.add_0.
+    destruct (decide (head'' = head1)) as [-> | Hne].
+    + (* CAS succeeds — LP for pop-success. *)
+      wp_cmpxchg_suc.
+      (* Open the AU.  We need [vs_au] to be non-empty; the proof of this
+         goes through [slot_state] (turn = exp_turn ⇒ slot is published ⇒
+         head1 < tail'' ⇒ vs_au has at least one element).  Left admitted. *)
+      iMod "AU" as (vs_au) "[Hf Hcommit]".
+      iDestruct (queue_content_agree with "Hγa Hf") as %->.
+      (* Establish [vs_au = v :: vs'] for some v.  Pure consequence of the
+         invariant + observed turn. *)
+      assert (Hvshd : ∃ v vs', vs_au = v :: vs') by admit.
+      destruct Hvshd as (v & vs_rest & ->).
+      iMod (queue_content_update _ _ _ vs_rest with "Hγa Hf")
+        as "[Hγa Hf]".
+      iDestruct "Hcommit" as "[_ Hcommit]".
+      iMod ("Hcommit" $! (Some v) with "[Hf]") as "HΦ".
+      { iExists vs_rest. by iFrame. }
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists (S head1), tail'', vs_rest, turns'', svals'', piph'', pipp''.
+        rewrite (_ : Z.of_nat (S head1) = (Z.of_nat head1 + 1)%Z); last lia.
+        rewrite Loc.add_0.
+        iFrame.
+        (* Pure invariant facts including the [pop_inflight] update.
+           Left admitted. *)
+        admit. }
+      wp_pures.
+      (* Step (2): read the slot's value (use the pop-inflight token to
+         identify the slot's contents).  Step (3): write the turn. *)
+      admit.
+    + (* CAS fails — recurse with the witnessed [head''] as new pos. *)
+      wp_cmpxchg_fail.
+      { intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
+        rewrite Loc.add_0. by iFrame. }
+      wp_pures.
+      iApply ("IH" with "AU").
+  - (* (B) turn ≠ exp_turn — re-read head and decide. *)
+    wp_pures.
+    wp_bind (! _)%E.
+    iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
+      "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
+         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+    rewrite Loc.add_0.
+    wp_load.
+    destruct (decide (head'' = head1)) as [-> | Hne].
+    + (* Head unchanged — LP for pop-failure: commit AU as [None]. *)
+      iMod "AU" as (vs_au) "[Hf [_ Hcommit]]".
+      iMod ("Hcommit" $! None with "Hf") as "HΦ".
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head1, tail'', vs'', turns'', svals'', piph'', pipp''.
+        rewrite Loc.add_0. by iFrame. }
+      wp_pures.
+      rewrite bool_decide_true; last done.
+      wp_pures. done.
+    + (* Head changed — recurse on the new witness. *)
+      iModIntro.
+      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      { iNext.
+        iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
+        rewrite Loc.add_0. by iFrame. }
+      wp_pures.
+      rewrite bool_decide_false.
+      2:{ intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
+      wp_pures.
+      iApply ("IH" with "AU").
 Admitted.
 
 End spec.

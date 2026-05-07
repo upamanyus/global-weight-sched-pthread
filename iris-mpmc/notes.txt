@@ -1,0 +1,131 @@
+Notes for the next agent — mpmcv1.v Iris linearizability proof
+================================================================
+
+Goal: prove logically atomic specs for Vyukov's MPMC ring-buffer queue in
+mpmcv1.v.  Toolchain: Iris (rocq-iris dev 2025-08-29) + HeapLang.
+Build with `eval $(opam env --switch=iris-dev) && make` from iris-mpmc/.
+
+State of the proof (right now)
+------------------------------
+
+mpmcv1.v COMPILES with these admits (grep -n "admit\|Admitted"):
+
+  1. slot_state body itself (Definition ... : Prop. Admitted.)
+       — the per-position lifecycle predicate; deliberately abstract.
+
+  2. new_queue_spec:
+       - re-indexing the flat AllocN block into per-slot turn/value pairs
+       - the all-zero slot_state instance
+
+  3. queue_push_spec — Löb induction set up; failure branches PROVED:
+       - turn = exp ∧ CAS fails → recurse: PROVED
+       - turn ≠ exp ∧ tail unchanged → AU commit b=false: PROVED
+       - turn ≠ exp ∧ tail changed → recurse: PROVED
+     Admitted:
+       - CAS-success branch ghost token allocation
+       - re-establishing invariant after CAS-success
+       - publication steps (slot value write + turn write)
+
+  4. queue_pop_spec — written in the same shape as push BUT not yet
+     compiled (the user interrupted compilation right after the edit).
+     RUN `make` FIRST and fix any errors.  Same admits structure as push
+     plus an extra `assert (∃ v vs', vs_au = v :: vs')` that needs proof.
+
+Architecture
+------------
+
+  • Ghost state:
+      γq : excl_authR (listO valO)            — abstract queue
+      γph : auth (gmap Z (excl val))          — push-inflight tokens
+      γpp : auth (gmap Z (excl val))          — pop-inflight tokens
+
+  • is_queue γq q cap holds (q +ₗ 2) ↦□ #slots persistently and the inv.
+
+  • LP placement:
+      - successful push: CAS on tail (vs becomes vs ++ [v]); pusher
+        receives a γph fragment {[ pos := Excl v ]} as the obligation
+        to publish (steps 2+3 of the impl).
+      - successful pop: CAS on head (vs becomes tail vs); popper
+        receives γpp fragment as obligation to advance the turn.
+      - failure branches: commit AU with vs unchanged; spec permits
+        spurious failures (no fullness/emptiness witness, which would
+        need prophecy variables).
+
+What to do next
+---------------
+
+  Step 0: `make` and fix queue_pop's compile errors.
+
+  Step 1: Define slot_state concretely.  Suggested form: a per-slot
+    case analysis matching on whether the most recent op at idx is
+    a published push, an in-flight push (∈ piph), a finished pop, or
+    an in-flight pop (∈ pipp).  See the long comment at lines ~170-191
+    in mpmcv1.v.
+
+  Step 2: Prove the two new_queue_spec admits.  Both are pure list
+    arithmetic (re-indexing big_sepL by pairs; trivial slot_state
+    for empty queue with all turns = 0).
+
+  Step 3: Discharge the queue_push success branch:
+      a. Token allocation lemma: for an [auth (gmap Z (excl val))],
+         frame-extending the auth and producing a fresh fragment.
+         Look for "auth_update_alloc" or use "own_update" with
+         "alloc_singleton_local_update".
+      b. After CAS-tail-success, prove length (vs_au ++ [v]) ≤ cap
+         from slot_state at idx (turn = exp_turn ⇒ slot is post-pop or
+         never-pushed ⇒ pos < head + cap).
+      c. Steps 2/3 (slot store + turn write): each opens the inv,
+         finds the slot via big_sepL_lookup_acc, performs the op,
+         updates piph (remove the entry on the turn write).
+
+  Step 4: Symmetric work for queue_pop.  The Hvshd assertion (vs_au
+    is non-empty) follows from: turn = (head/cap)*2+1 ⇒ slot is
+    published ⇒ head1 < tail'' ⇒ length vs_au = tail'' - head1 ≥ 1.
+
+Helpful lemmas / tactics
+------------------------
+
+  • iCombine "Hauth Hfrag" gives %... — extract validity / agreement.
+  • excl_auth_agree_L, excl_auth_update — the two ghost ops we use.
+  • For the gmap auth: auth_update, alloc_singleton_local_update,
+      delete_singleton_local_update.
+  • big_sepL_lookup_acc — extract i-th element from [∗ list].
+  • Loc.add_0 — for q +ₗ 0 ↔ q.
+  • wp_cmpxchg_suc / wp_cmpxchg_fail (with a goal "values differ").
+  • Nat2Z.inj : Z.of_nat n = Z.of_nat m → n = m.
+
+Invariants to keep visible
+--------------------------
+
+  queue_inv_inner γq γph γpp q slots cap takes 7 existentials:
+    head tail (nats), vs (list val), turns svals (list val),
+    piph pipp (gmap Z val).
+
+  Pure facts:
+    head ≤ tail ≤ head + cap
+    length turns = cap, length svals = cap
+    length vs = tail - head
+    dom piph ⊆ [head, tail), dom pipp ⊆ [0, head)
+
+  Heap:
+    (q +ₗ 0) ↦ #(Z.of_nat head)
+    (q +ₗ 1) ↦ #(Z.of_nat tail)
+    [∗ list] i ↦ tv ∈ turns, ⌜∃ z, tv = #z⌝ ∗ (slots +ₗ 2*i) ↦ tv
+    [∗ list] i ↦ sv ∈ svals, (slots +ₗ 2*i+1) ↦ sv
+
+  Ghost:
+    own γq (●E vs)
+    own γph (● (Excl <$> piph))
+    own γpp (● (Excl <$> pipp))
+
+  Pure slot-state coupling: ∀ i < cap, ∃ z, turns!!i = Some #z ∧
+    slot_state cap head tail vs piph pipp i z (default #0 svals!!i).
+
+Style notes from the user
+-------------------------
+
+  • The user is at MIT (PhD/researcher level).  Concise prose, no
+    emojis.  Don't editorialize about difficulty.
+  • Commit at milestones with HEREDOC commit messages.
+  • Update tasks via the task tool when iterating.
+  • Don't use destructive git operations without asking.
