@@ -287,7 +287,18 @@ Qed.
 
 (** A flat block of [2*n] zero-initialised cells from [AllocN] can be re-indexed
     as two parallel arrays of length [n] (turn cells at offsets [2*i],
-    value cells at offsets [2*i+1]).  Used by [new_queue_spec]. *)
+    value cells at offsets [2*i+1]).  Used by [new_queue_spec].
+
+    NOTE: the proof is left admitted.  The induction step gets stuck on
+    matching the singleton at index [n] of [replicate (S n) #0] (via
+    [replicate_S_end] and [big_sepL_app]) against the witnessed pointsto
+    at offset [Z.of_nat (n + n)] (resp. [Z.of_nat (S (n + n))]).  Iris's
+    [iExact]/[iFrame] cannot bridge the [(2 * Z.of_nat n)%Z] vs.
+    [Z.of_nat (n + n)] mismatch even after [replace ... by lia], suggesting
+    the goal still has a non-reduced [(n + 0)] subterm or a stuck
+    [Z.of_nat] coercion.  Cleanest fix is probably to state the lemma in
+    [seq] form throughout and convert to [replicate] form with a separate
+    [big_sepL_seq_replicate]-style lemma. *)
 Lemma alloc_block_split_zero (l : loc) (n : nat) :
   ([∗ list] i ∈ seq 0 (2*n), (l +ₗ (i : nat)) ↦ #0) ⊢
   ([∗ list] i ↦ tv ∈ replicate n #0,
@@ -295,28 +306,7 @@ Lemma alloc_block_split_zero (l : loc) (n : nat) :
   ([∗ list] i ↦ sv ∈ replicate n #0,
      (l +ₗ (2 * Z.of_nat i + 1)) ↦ sv).
 Proof.
-  iIntros "H".
-  iInduction n as [|n IH] forall (l).
-  { simpl. by iSplitL. }
-  replace (2 * S n)%nat with (2 * n + 2)%nat by lia.
-  rewrite seq_app big_sepL_app.
-  iDestruct "H" as "[Hrest Hpair]".
-  iDestruct ("IH" with "Hrest") as "[HtR HsR]".
-  rewrite (replicate_S_end n #0) !big_sepL_app !length_replicate.
-  simpl.
-  iDestruct "Hpair" as "(Hp0 & Hp1 & _)".
-  iSplitL "HtR Hp0".
-  - iSplitL "HtR"; first iFrame.
-    rewrite right_id.
-    iSplit.
-    { iPureIntro. by exists 0%Z. }
-    rewrite (_ : (2 * Z.of_nat (n + 0))%Z = Z.of_nat (0 + 2 * n)); last lia.
-    iExact "Hp0".
-  - iSplitL "HsR"; first iFrame.
-    rewrite right_id.
-    rewrite (_ : (2 * Z.of_nat (n + 0) + 1)%Z = Z.of_nat (1 + 2 * n)); last lia.
-    iExact "Hp1".
-Qed.
+Admitted.
 
 (* -------------------------------------------------------------------------- *)
 (*                       Specification: [new_queue]                           *)
@@ -368,9 +358,14 @@ Proof.
            ([∗ list] i ↦ sv ∈ replicate capn #0,
               (slots +ₗ (2 * Z.of_nat i + 1)) ↦ sv))%I
           with "[Hslots]" as "[Ht0 Hs0]".
-  { (* Pure index-arithmetic re-indexing of the slot block.
-       The flat array of [cap*2] cells split into the per-slot pairs. *)
-    admit. }
+  { (* Pure index-arithmetic re-indexing of the slot block.  Drop the
+       meta tokens and apply [alloc_block_split_zero]. *)
+    rewrite (_ : Z.to_nat (cap * 2) = 2 * capn); last (subst capn; lia).
+    iAssert ([∗ list] i ∈ seq 0 (2 * capn), (slots +ₗ (i : nat)) ↦ #0)%I
+      with "[Hslots]" as "Hflat".
+    { iApply (big_sepL_mono with "Hslots").
+      iIntros (k v _) "[$ _]". }
+    iApply (alloc_block_split_zero with "Hflat"). }
   iMod (inv_alloc queueN _
           (queue_inv_inner γq γph γpp q slots capn)
           with "[-HΦ Hγf]") as "#Hinv".
@@ -398,7 +393,7 @@ Proof.
   iModIntro. iApply ("HΦ" $! q γq).
   iSplitR "Hγf"; last by iFrame.
   iExists γph, γpp, slots. by iFrame "Hs Hinv".
-Admitted.
+Qed.
 
 (* -------------------------------------------------------------------------- *)
 (*                         Specification: [queue_push]                        *)

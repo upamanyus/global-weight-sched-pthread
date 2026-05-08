@@ -10,10 +10,21 @@ State of the proof (right now)
 
 mpmcv1.v COMPILES with these admits (grep -n "admit\|Admitted"):
 
-  1. new_queue_spec:
-       - line 336: re-indexing the flat AllocN block into per-slot turn/value
-         pairs (pure list manipulation; needs a big_sepL "interleave" helper)
-       - line 364: trailing Admitted (closes once the above is done)
+  1. alloc_block_split_zero (helper lemma): Admitted.
+       Re-indexing of the flat [seq 0 (2*n)] of pointsto's into per-slot
+       turn/value pairs.  The induction step gets stuck matching the
+       singleton at index [n] of [replicate (S n) #0] against the
+       witnessed pointsto offset [Z.of_nat (n + n)] / [Z.of_nat (S (n+n))]
+       — the pointsto location mismatch ([(2 * Z.of_nat n)%Z] vs.
+       [Z.of_nat (n + n)]) doesn't bridge cleanly via [iExact]/[iFrame]
+       even after [replace ... by lia].  Cleanest fix: state the lemma
+       in [seq] form throughout and convert to [replicate] form via a
+       separate [big_sepL_seq_replicate] lemma, OR write the proof as a
+       monolithic pure rewriting (using [big_opL_unseal] etc.).
+
+  1b. new_queue_spec — body fully Qed.  Its slot-block split uses
+      [alloc_block_split_zero] which is admitted (above); when that is
+      proved, [new_queue_spec] closes immediately.
 
   2. queue_push_spec — Löb induction set up; failure branches PROVED;
      CAS-success branch ghost-token allocation PROVED.
