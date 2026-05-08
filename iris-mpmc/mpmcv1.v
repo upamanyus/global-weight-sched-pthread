@@ -491,6 +491,37 @@ Proof.
   iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
   { iNext.
     iExists head', tail', vs', turns', svals', piph', pipp'. by iFrame. }
+  (* From [Hslots'] at idx, derive a conditional bound: if [z] matches the
+     expected push turn at [tail1], then [tail1 < head' + cap].  This is the
+     load-time fact we propagate to the CAS opening via [Hhd_lb]. *)
+  assert (Hbound : z = (2 * Z.of_nat (tail1 / cap))%Z → (tail1 < head' + cap)%nat).
+  { intro Hzeq.
+    destruct (Hslots' idx Hidx) as (z0 & Htidx & Hss).
+    rewrite Htv in Htidx. injection Htidx as <-.
+    assert (Hidx_eq : idx = (tail1 mod cap)%nat) by reflexivity.
+    destruct Hss as
+      [(p & Hpr & Hpmod & [(Hpin & Hzturn) | (Hpni & Hzturn & Hvslook)])
+       | [(Hnocur & p & Hph & Hpmod & [(Hpin & Hzturn) | (Hpni & Hzturn)])
+          | (Hnocur & Hnopop & Hz0)]].
+    - (* A1: turn = 2*(p/cap); from Hzeq, p/cap = tail1/cap; with same mod, p = tail1. *)
+      assert (Hdiv : (p / cap)%nat = (tail1 / cap)%nat) by (apply Nat2Z.inj; lia).
+      assert (Hmod : (p mod cap)%nat = (tail1 mod cap)%nat) by (rewrite Hpmod; exact Hidx_eq).
+      pose proof (Nat.div_mod_eq p cap) as Hpdm.
+      pose proof (Nat.div_mod_eq tail1 cap) as Htdm.
+      lia.
+    - (* A2: turn = 2*(p/cap)+1 (odd); contradicts z even. *) lia.
+    - (* B1: turn = 2*(p/cap)+1 (odd); contradicts z even. *) lia.
+    - (* B2: turn = 2*(p/cap)+2; from Hzeq, p/cap+1 = tail1/cap; with same mod, p+cap = tail1. *)
+      assert (Hdiv : (p / cap + 1)%nat = (tail1 / cap)%nat) by (apply Nat2Z.inj; lia).
+      assert (Hmod : (p mod cap)%nat = (tail1 mod cap)%nat) by (rewrite Hpmod; exact Hidx_eq).
+      pose proof (Nat.div_mod_eq p cap) as Hpdm.
+      pose proof (Nat.div_mod_eq tail1 cap) as Htdm.
+      lia.
+    - (* C: turn = 0; from Hzeq, tail1/cap = 0, so tail1 < cap. *)
+      assert (Hdiv : (tail1 / cap = 0)%nat) by (apply Nat2Z.inj; lia).
+      pose proof (Nat.mod_upper_bound tail1 cap ltac:(lia)) as Hmod.
+      pose proof (Nat.div_mod_eq tail1 cap) as Htdm.
+      lia. }
   wp_pures.
   (* === Compare the witnessed turn [z] with the expected turn === *)
   set (exp_turn := (Z.of_nat tail1 `quot` Z.of_nat cap * 2)%Z).
@@ -512,11 +543,17 @@ Proof.
       iMod (queue_content_update _ _ _ (vs_au ++ [v]) with "Hγa Hf")
         as "[Hγa Hf]".
       iMod ("Hcommit" $! true with "Hf") as "HΦ".
-      (* Allocate a push-inflight token at [tail1] mapping to [v].  This
-         lets steps (2) and (3) of the implementation locate the slot
-         and commit the publication.  Updating the auth ghost is a frame
-         lemma over [auth (gmap _ (excl _))]; we leave the token-creation
-         step admitted. *)
+      (* Bridge from the load-time slot_state observation to the CAS-time
+         state via [Hbound] and the [Hhd_lb] head-snapshot. *)
+      assert (Hzeq : z = (2 * Z.of_nat (tail1 / cap))%Z).
+      { assert (Hzz : z = exp_turn) by congruence.
+        rewrite Hzz. unfold exp_turn.
+        rewrite Z.quot_div_nonneg; [|lia|lia].
+        rewrite -Nat2Z.inj_div. lia. }
+      specialize (Hbound Hzeq).
+      iDestruct (mono_nat_lb_own_valid with "Hγhd Hhd_lb") as %[_ Hhd_le].
+      assert (Htbnd : (tail1 < head'' + cap)%nat) by lia.
+      (* Allocate a push-inflight token at [tail1] mapping to [v]. *)
       iAssert (|==> own γph (● ((Excl <$> <[Z.of_nat tail1 := v]>piph'')
                                   : gmap Z (excl val))) ∗
                     own γph (◯ ({[Z.of_nat tail1 := Excl v]}
@@ -538,6 +575,8 @@ Proof.
             by (apply elem_of_dom; eauto).
           specialize (Hphdom'' _ Hin). lia. }
         iModIntro. iFrame. }
+      (* Bump the [γtl] ghost monotonically from [tail1] to [S tail1]. *)
+      iMod (mono_nat_own_update (S tail1) with "Hγtl") as "[Hγtl _]"; [lia|].
       iModIntro.
       iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
@@ -545,11 +584,74 @@ Proof.
                 (<[Z.of_nat tail1 := v]>piph''), pipp''.
         rewrite (_ : Z.of_nat (S tail1) = (Z.of_nat tail1 + 1)%Z); last lia.
         iFrame.
-        (* Re-establish the pure facts of the invariant.  These are the
-           reasons we tracked head/tail/vs and the in-flight maps so
-           explicitly; the proofs are pure arithmetic and manipulation
-           of [slot_state].  Left admitted. *)
-        admit. }
+        iPureIntro. split_and!.
+        - lia.
+        - lia.
+        - exact Htlen''.
+        - exact Hslen''.
+        - rewrite length_app /=. lia.
+        - intros p Hp. rewrite dom_insert_L in Hp.
+          apply elem_of_union in Hp as [Hp%elem_of_singleton | Hp].
+          + subst p. lia.
+          + specialize (Hphdom'' _ Hp). lia.
+        - exact Hppdom''.
+        - intros i Hi.
+          destruct (decide (i = idx)) as [-> | Hineq].
+          + (* i = idx: new state must be A1 with p = tail1.  Requires
+               z₀_cas = 2*(tail1/cap), which would follow from slot-turn
+               monotonicity (out of scope of the current ghost theory). *)
+            destruct (Hslots'' idx Hidx) as (z0 & Htidx & _).
+            exists z0. split; [exact Htidx|].
+            left. exists tail1.
+            split; [lia|]. split.
+            * subst idx. reflexivity.
+            * left. split.
+              -- rewrite dom_insert_L. set_solver.
+              -- (* z0 = 2 * Z.of_nat (tail1 / cap) -- needs slot-turn mono ghost. *)
+                 admit.
+          + (* i ≠ idx: preserve old slot_state from [Hslots'']. *)
+            destruct (Hslots'' i Hi) as (z' & Htidx & Hss).
+            exists z'. split; [exact Htidx|].
+            destruct Hss as
+              [(p & Hpr & Hpmod & [(Hpin & Hzturn) | (Hpni & Hzturn & Hvslook)])
+               | [(Hnocur & p & Hph & Hpmod & [(Hpin & Hzturn) | (Hpni & Hzturn)])
+                  | (Hnocur & Hnopop & Hzz0)]].
+            * (* Old A1 → new A1 (same p < tail1). *)
+              left. exists p. split; [lia|]. split; [exact Hpmod|].
+              left. split; [|exact Hzturn].
+              rewrite dom_insert_L. apply elem_of_union_r. exact Hpin.
+            * (* Old A2 → new A2 (same p < tail1; index into vs unchanged). *)
+              left. exists p. split; [lia|]. split; [exact Hpmod|].
+              right. split.
+              -- rewrite dom_insert_L.
+                 assert (Hne : Z.of_nat p ≠ Z.of_nat tail1) by lia.
+                 set_solver.
+              -- split; [exact Hzturn|].
+                 rewrite lookup_app_l; [exact Hvslook|]. lia.
+            * (* Old B1 → new B1 (extend no-current to [head'', S tail1)). *)
+              right. left. split.
+              -- intros p' Hp' Hpmodeq.
+                 destruct (decide (p' = tail1)) as [-> | Hp'ne].
+                 ++ apply Hineq. subst idx. by rewrite -Hpmodeq.
+                 ++ apply (Hnocur p'); [lia|exact Hpmodeq].
+              -- exists p. split; [exact Hph|]. split; [exact Hpmod|].
+                 left. split; [exact Hpin|exact Hzturn].
+            * (* Old B2 → new B2. *)
+              right. left. split.
+              -- intros p' Hp' Hpmodeq.
+                 destruct (decide (p' = tail1)) as [-> | Hp'ne].
+                 ++ apply Hineq. subst idx. by rewrite -Hpmodeq.
+                 ++ apply (Hnocur p'); [lia|exact Hpmodeq].
+              -- exists p. split; [exact Hph|]. split; [exact Hpmod|].
+                 right. split; [exact Hpni|exact Hzturn].
+            * (* Old C → new C. *)
+              right. right. split_and!.
+              -- intros p' Hp' Hpmodeq.
+                 destruct (decide (p' = tail1)) as [-> | Hp'ne].
+                 ++ apply Hineq. subst idx. by rewrite -Hpmodeq.
+                 ++ apply (Hnocur p'); [lia|exact Hpmodeq].
+              -- exact Hnopop.
+              -- exact Hzz0. }
       wp_pures.
       (* Steps (2): write the slot value.  Open the invariant, locate the
          slot via the in-flight token, perform the store, restore the
