@@ -31,7 +31,7 @@
 
 From iris.algebra Require Import excl auth gmap numbers.
 From iris.algebra.lib Require Import excl_auth.
-From iris.base_logic.lib Require Export invariants.
+From iris.base_logic.lib Require Export invariants mono_nat.
 From iris.program_logic Require Export atomic weakestpre.
 From iris.heap_lang Require Import lang notation proofmode.
 From iris.prelude Require Import options.
@@ -132,11 +132,13 @@ Definition tokenUR : ucmra := authUR (gmapUR Z (exclR valO)).
 Class queueG Σ := QueueG {
   #[local] queueG_content :: inG Σ (excl_authR (listO valO));
   #[local] queueG_inflight :: inG Σ tokenUR;
+  #[local] queueG_mono :: mono_natG Σ;
 }.
 
 Definition queueΣ : gFunctors :=
   #[GFunctor (excl_authR (listO valO));
-    GFunctor tokenUR].
+    GFunctor tokenUR;
+    mono_natΣ].
 
 Global Instance subG_queueΣ {Σ} : subG queueΣ Σ → queueG Σ.
 Proof. solve_inG. Qed.
@@ -216,7 +218,7 @@ Definition slot_state
    turn = 0%Z).
 
 Definition queue_inv_inner
-    (γq γph γpp : gname) (q slots : loc) (cap : nat) : iProp Σ :=
+    (γq γph γpp γhd γtl : gname) (q slots : loc) (cap : nat) : iProp Σ :=
   ∃ (head tail : nat) (vs : list val)
     (turns svals : list val)
     (push_inflight pop_inflight : gmap Z val),
@@ -231,6 +233,8 @@ Definition queue_inv_inner
     own γq (●E vs) ∗
     own γph (● ((Excl <$> push_inflight) : gmap Z (excl val))) ∗
     own γpp (● ((Excl <$> pop_inflight) : gmap Z (excl val))) ∗
+    mono_nat_auth_own γhd 1 head ∗
+    mono_nat_auth_own γtl 1 tail ∗
     ([∗ list] i ↦ tv ∈ turns,
        ⌜∃ z : Z, tv = #z⌝ ∗
        (slots +ₗ (2 * Z.of_nat i)) ↦ tv) ∗
@@ -247,10 +251,10 @@ Definition queueN := nroot .@ "mpmcv1".
     a pinned [slots] pointer ([↦□]) and the namespace invariant relating the
     physical state to [γq]. *)
 Definition is_queue (γq : gname) (q : loc) (cap : nat) : iProp Σ :=
-  ∃ γph γpp (slots : loc),
+  ∃ γph γpp γhd γtl (slots : loc),
     ⌜(0 < cap)%nat⌝ ∗
     (q +ₗ 2) ↦□ #slots ∗
-    inv queueN (queue_inv_inner γq γph γpp q slots cap).
+    inv queueN (queue_inv_inner γq γph γpp γhd γtl q slots cap).
 
 Definition queue_content (γq : gname) (vs : list val) : iProp Σ :=
   own γq (◯E vs).
@@ -363,6 +367,8 @@ Proof.
   iMod (own_alloc (● (∅ : gmapUR Z (exclR valO))))
     as (γpp) "Hγpp".
   { by apply auth_auth_valid. }
+  iMod (mono_nat_own_alloc 0) as (γhd) "[Hγhd _]".
+  iMod (mono_nat_own_alloc 0) as (γtl) "[Hγtl _]".
   (* Build the slot pointsto's. *)
   set (capn := Z.to_nat cap).
   assert (Hcapn : (0 < capn)%nat) by (subst capn; lia).
@@ -382,7 +388,7 @@ Proof.
       iIntros (k v _) "[$ _]". }
     iApply (alloc_block_split_zero with "Hflat"). }
   iMod (inv_alloc queueN _
-          (queue_inv_inner γq γph γpp q slots capn)
+          (queue_inv_inner γq γph γpp γhd γtl q slots capn)
           with "[-HΦ Hγf]") as "#Hinv".
   { iNext.
     iExists 0%nat, 0%nat, [], (replicate capn #0), (replicate capn #0),
@@ -394,7 +400,7 @@ Proof.
     iSplit; [done|].
     iSplit; [iPureIntro; set_solver|].
     iSplit; [iPureIntro; set_solver|].
-    iFrame "Hh Ht Hγa Hγph Hγpp Ht0 Hs0".
+    iFrame "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Ht0 Hs0".
     iPureIntro.
     (* The slot-state invariant for the all-zero case: every slot is in
        case (C) ("never touched"), with vacuous quantifiers since head =
@@ -407,7 +413,7 @@ Proof.
     - reflexivity. }
   iModIntro. iApply ("HΦ" $! q γq).
   iSplitR "Hγf"; last by iFrame.
-  iExists γph, γpp, slots. by iFrame "Hs Hinv".
+  iExists γph, γpp, γhd, γtl, slots. by iFrame "Hs Hinv".
 Qed.
 
 (* -------------------------------------------------------------------------- *)
@@ -430,7 +436,7 @@ Lemma queue_push_spec γq q cap (v : val) :
       | RET #b }>>.
 Proof.
   iIntros "#Hq" (Φ) "AU".
-  iDestruct "Hq" as (γph γpp slots) "(%Hcap & #Hs & #Hinv)".
+  iDestruct "Hq" as (γph γpp γhd γtl slots) "(%Hcap & #Hs & #Hinv)".
   rewrite /queue_push. wp_pures.
   (* === Step 1: read the slots pointer (it is persistent: ↦□) === *)
   wp_load.
@@ -439,10 +445,10 @@ Proof.
   wp_bind (! _)%E.
   iInv "Hinv" as (head1 tail1 vs1 turns1 svals1 piph1 pipp1)
     "(>%Hht1 & >%Htlen1 & >%Hslen1 & >%Hvslen1 & >%Hphdom1 & >%Hppdom1 &
-       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots1)".
+       Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots1)".
   wp_load.
   iModIntro.
-  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
   { iNext.
     iExists head1, tail1, vs1, turns1, svals1, piph1, pipp1. by iFrame. }
   wp_pures.
@@ -464,7 +470,9 @@ Proof.
   wp_bind (! _)%E.
   iInv "Hinv" as (head' tail' vs' turns' svals' piph' pipp')
     "(>%Hht' & >%Htlen' & >%Hslen' & >%Hvslen' & >%Hphdom' & >%Hppdom' &
-       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots')".
+       Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots')".
+  (* Snapshot of the head ghost: gives [head' ≤ head''] at any later opening. *)
+  iDestruct (mono_nat_lb_own_get with "Hγhd") as "#Hhd_lb".
   (* Extract the [idx]-th turn pointsto from [Htblock]. *)
   assert (Hlt : (idx < length turns')%nat) by (rewrite Htlen'; lia).
   destruct (lookup_lt_is_Some_2 _ _ Hlt) as [tv Htv].
@@ -480,7 +488,7 @@ Proof.
   iDestruct ("Hclose" with "[Hslot]") as "Htblock".
   { iSplit; [iPureIntro; by exists z|]. iFrame. }
   iModIntro.
-  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
   { iNext.
     iExists head', tail', vs', turns', svals', piph', pipp'. by iFrame. }
   wp_pures.
@@ -493,7 +501,7 @@ Proof.
     wp_bind (CmpXchg _ _ _).
     iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
       "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
-         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+         Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots'')".
     (* CAS succeeds iff [#(Z.of_nat tail'') = #(Z.of_nat tail1)]. *)
     destruct (decide (tail'' = tail1)) as [-> | Hne].
     + (* CAS succeeds — LP for push-success. *)
@@ -531,7 +539,7 @@ Proof.
           specialize (Hphdom'' _ Hin). lia. }
         iModIntro. iFrame. }
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', (S tail1), (vs_au ++ [v]), turns'', svals'',
                 (<[Z.of_nat tail1 := v]>piph''), pipp''.
@@ -551,7 +559,7 @@ Proof.
       wp_cmpxchg_fail.
       { intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
         by iFrame. }
@@ -562,14 +570,14 @@ Proof.
     wp_bind (! _)%E.
     iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
       "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
-         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+         Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots'')".
     wp_load.
     destruct (decide (tail'' = tail1)) as [-> | Hne].
     + (* Tail unchanged — LP for push-failure: commit AU as [b = false]. *)
       iMod "AU" as (vs_au) "[Hf [_ Hcommit]]".
       iMod ("Hcommit" $! false with "Hf") as "HΦ".
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', tail1, vs'', turns'', svals'', piph'', pipp''.
         by iFrame. }
@@ -578,7 +586,7 @@ Proof.
       wp_pures. done.
     + (* Tail changed — recurse on the new witness. *)
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
         by iFrame. }
@@ -607,7 +615,7 @@ Lemma queue_pop_spec γq q cap :
       | RET (match ov with Some v => SOMEV v | None => NONEV end) }>>.
 Proof.
   iIntros "#Hq" (Φ) "AU".
-  iDestruct "Hq" as (γph γpp slots) "(%Hcap & #Hs & #Hinv)".
+  iDestruct "Hq" as (γph γpp γhd γtl slots) "(%Hcap & #Hs & #Hinv)".
   rewrite /queue_pop. wp_pures.
   (* === Read slots (persistent) === *)
   wp_load.
@@ -616,10 +624,10 @@ Proof.
   wp_bind (! _)%E.
   iInv "Hinv" as (head1 tail1 vs1 turns1 svals1 piph1 pipp1)
     "(>%Hht1 & >%Htlen1 & >%Hslen1 & >%Hvslen1 & >%Hphdom1 & >%Hppdom1 &
-       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots1)".
+       Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots1)".
   wp_load.
   iModIntro.
-  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
   { iNext.
     iExists head1, tail1, vs1, turns1, svals1, piph1, pipp1.
     by iFrame. }
@@ -639,7 +647,9 @@ Proof.
   wp_bind (! _)%E.
   iInv "Hinv" as (head' tail' vs' turns' svals' piph' pipp')
     "(>%Hht' & >%Htlen' & >%Hslen' & >%Hvslen' & >%Hphdom' & >%Hppdom' &
-       Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots')".
+       Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots')".
+  (* Snapshot of the tail ghost: gives [tail' ≤ tail''] at any later opening. *)
+  iDestruct (mono_nat_lb_own_get with "Hγtl") as "#Htl_lb".
   assert (Hlt : (idx < length turns')%nat) by (rewrite Htlen'; lia).
   destruct (lookup_lt_is_Some_2 _ _ Hlt) as [tv Htv].
   iDestruct (big_sepL_lookup_acc _ _ _ _ Htv with "Htblock")
@@ -651,7 +661,7 @@ Proof.
   iDestruct ("Hclose" with "[Hslot]") as "Htblock".
   { iSplit; [iPureIntro; by exists z|]. iFrame. }
   iModIntro.
-  iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+  iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
   { iNext.
     iExists head', tail', vs', turns', svals', piph', pipp'. by iFrame. }
   wp_pures.
@@ -662,7 +672,7 @@ Proof.
     wp_bind (CmpXchg _ _ _).
     iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
       "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
-         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+         Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots'')".
     rewrite Loc.add_0.
     destruct (decide (head'' = head1)) as [-> | Hne].
     + (* CAS succeeds — LP for pop-success. *)
@@ -682,7 +692,7 @@ Proof.
       iMod ("Hcommit" $! (Some v) with "[Hf]") as "HΦ".
       { iExists vs_rest. by iFrame. }
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists (S head1), tail'', vs_rest, turns'', svals'', piph'', pipp''.
         rewrite (_ : Z.of_nat (S head1) = (Z.of_nat head1 + 1)%Z); last lia.
@@ -699,7 +709,7 @@ Proof.
       wp_cmpxchg_fail.
       { intros [= Heq']. apply Nat2Z.inj in Heq'. by apply Hne. }
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
         rewrite Loc.add_0. by iFrame. }
@@ -710,7 +720,7 @@ Proof.
     wp_bind (! _)%E.
     iInv "Hinv" as (head'' tail'' vs'' turns'' svals'' piph'' pipp'')
       "(>%Hht'' & >%Htlen'' & >%Hslen'' & >%Hvslen'' & >%Hphdom'' & >%Hppdom'' &
-         Hh & Ht & Hγa & Hγph & Hγpp & Htblock & Hsblock & >%Hslots'')".
+         Hh & Ht & Hγa & Hγph & Hγpp & Hγhd & Hγtl & Htblock & Hsblock & >%Hslots'')".
     rewrite Loc.add_0.
     wp_load.
     destruct (decide (head'' = head1)) as [-> | Hne].
@@ -718,7 +728,7 @@ Proof.
       iMod "AU" as (vs_au) "[Hf [_ Hcommit]]".
       iMod ("Hcommit" $! None with "Hf") as "HΦ".
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head1, tail'', vs'', turns'', svals'', piph'', pipp''.
         rewrite Loc.add_0. by iFrame. }
@@ -727,7 +737,7 @@ Proof.
       wp_pures. done.
     + (* Head changed — recurse on the new witness. *)
       iModIntro.
-      iSplitL "Hh Ht Hγa Hγph Hγpp Htblock Hsblock".
+      iSplitL "Hh Ht Hγa Hγph Hγpp Hγhd Hγtl Htblock Hsblock".
       { iNext.
         iExists head'', tail'', vs'', turns'', svals'', piph'', pipp''.
         rewrite Loc.add_0. by iFrame. }
