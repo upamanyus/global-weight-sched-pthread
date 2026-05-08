@@ -306,7 +306,22 @@ Lemma alloc_block_split_zero (l : loc) (n : nat) :
   ([∗ list] i ↦ sv ∈ replicate n #0,
      (l +ₗ (2 * Z.of_nat i + 1)) ↦ sv).
 Proof.
-Admitted.
+  induction n as [|n IH].
+  - simpl. iIntros "_". by iSplit.
+  - rewrite (Nat.mul_succ_r 2 n) seq_app big_sepL_app.
+    rewrite (replicate_S_end n #0).
+    rewrite !big_sepL_app !length_replicate /=.
+    iIntros "[Hpre Hpost]".
+    iDestruct (IH with "Hpre") as "[$ $]".
+    iDestruct "Hpost" as "(H1 & H2 & _)".
+    rewrite (_ : Z.of_nat (0 + 2 * n) = (2 * Z.of_nat n)%Z); last lia.
+    rewrite (_ : Z.of_nat (S (0 + 2 * n)) = (2 * Z.of_nat n + 1)%Z); last lia.
+    rewrite (_ : Z.of_nat (n + 0) = Z.of_nat n); last lia.
+    iSplitL "H1".
+    + iSplitL "H1"; last done.
+      iSplit; [iPureIntro; by exists 0%Z|]. iFrame.
+    + iSplitL "H2"; last done. iFrame.
+Qed.
 
 (* -------------------------------------------------------------------------- *)
 (*                       Specification: [new_queue]                           *)
